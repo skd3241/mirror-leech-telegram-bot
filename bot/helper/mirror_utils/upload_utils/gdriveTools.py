@@ -58,6 +58,7 @@ class GoogleDriveHelper:
         self.is_downloading = False
         self.is_cloning = False
         self.is_cancelled = False
+        self.is_errored = False
         self.status = None
         self.dstatus = None
         self.updater = None
@@ -163,7 +164,7 @@ class GoogleDriveHelper:
                                                    body=permissions).execute()
 
     @retry(wait=wait_exponential(multiplier=2, min=3, max=6), stop=stop_after_attempt(3),
-           retry=retry_if_exception_type(HttpError), before=before_log(LOGGER, logging.DEBUG))
+           retry=(retry_if_exception_type(HttpError) | retry_if_exception_type(IOError)), before=before_log(LOGGER, logging.DEBUG))
     def __upload_file(self, file_path, file_name, mime_type, parent_id):
         # File body description
         file_metadata = {
@@ -214,8 +215,7 @@ class GoogleDriveHelper:
                         LOGGER.info(f"Got: {reason}, Trying Again.")
                         return self.__upload_file(file_path, file_name, mime_type, parent_id)
                     else:
-                        self.is_cancelled = True
-                        LOGGER.info(f"Got: {reason}")
+                        LOGGER.error(f"Got: {reason}")
                         raise err
         if self.is_cancelled:
             return
@@ -263,14 +263,16 @@ class GoogleDriveHelper:
                 err = e
             LOGGER.error(err)
             self.__listener.onUploadError(str(err))
-            self.is_cancelled = True
+            self.is_errored = True
         finally:
             self.updater.cancel()
-            if self.is_cancelled:
+            if self.is_cancelled and not self.is_errored:
                 if mime_type == 'Folder':
                     LOGGER.info("Deleting uploaded data from Drive...")
                     link = f"https://drive.google.com/folderview?id={dir_id}"
                     self.deletefile(link)
+                return
+            elif self.is_errored:
                 return
         self.__listener.onUploadComplete(link, size, self.__total_files, self.__total_folders, mime_type, self.name)
 
@@ -301,7 +303,7 @@ class GoogleDriveHelper:
                             return self.__copyFile(file_id, dest_id)
                     else:
                         self.is_cancelled = True
-                        LOGGER.info(f"Got: {reason}")
+                        LOGGER.error(f"Got: {reason}")
                         raise err
                 else:
                     raise err
@@ -364,7 +366,7 @@ class GoogleDriveHelper:
                 durl = short_url(durl)
                 buttons.buildbutton("☁️ Drive Link", durl)
                 if INDEX_URL is not None:
-                    url_path = rquote(f'{meta.get("name")}')
+                    url_path = rquote(f'{meta.get("name")}', safe='')
                     url = f'{INDEX_URL}/{url_path}/'
                     url = short_url(url)
                     buttons.buildbutton("⚡ Index Link", url)
@@ -380,7 +382,7 @@ class GoogleDriveHelper:
                 msg += f'\n\n<b>Size: </b>{get_readable_file_size(int(meta.get("size", 0)))}'
                 msg += f'\n\n<b>Type: </b>{mime_type}'
                 if INDEX_URL is not None:
-                    url_path = rquote(f'{file.get("name")}')
+                    url_path = rquote(f'{file.get("name")}', safe='')
                     url = f'{INDEX_URL}/{url_path}'
                     url = short_url(url)
                     buttons.buildbutton("⚡ Index Link", url)
@@ -518,27 +520,6 @@ class GoogleDriveHelper:
                 return build('drive', 'v3', credentials=credentials, cache_discovery=False)
         return None
 
-    def __edit_telegraph(self):
-        nxt_page = 1
-        prev_page = 0
-        for content in self.telegraph_content :
-            if nxt_page == 1 :
-                content += f'<b><a href="https://telegra.ph/{self.path[nxt_page]}">Next</a></b>'
-                nxt_page += 1
-            else :
-                if prev_page <= self.num_of_path:
-                    content += f'<b><a href="https://telegra.ph/{self.path[prev_page]}">Prev</a></b>'
-                    prev_page += 1
-                if nxt_page < self.num_of_path:
-                    content += f'<b> | <a href="https://telegra.ph/{self.path[nxt_page]}">Next</a></b>'
-                    nxt_page += 1
-            telegraph.edit_page(
-                path = self.path[prev_page],
-                title = 'Mirror-Leech-Bot Drive Search',
-                content=content
-            )
-        return
-
     def __escapes(self, str):
         chars = ['\\', "'", '"', r'\a', r'\b', r'\f', r'\n', r'\r', r'\t']
         for char in chars:
@@ -675,7 +656,7 @@ class GoogleDriveHelper:
                         if isRecur:
                             url_path = "/".join([rquote(n, safe='') for n in self.__get_recursive_list(file, parent_id)])
                         else:
-                            url_path = rquote(f'{file.get("name")}')
+                            url_path = rquote(f'{file.get("name")}', safe='')
                         url = f'{INDEX_URLS[index]}/{url_path}/'
                         url = short_url(url)
                         msg += f' <b>| <a href="{url}">Index Link</a></b>'
@@ -726,9 +707,8 @@ class GoogleDriveHelper:
                 )["path"]
             )
         time.sleep(0.5)
-        self.num_of_path = len(self.path)
-        if self.num_of_path > 1:
-            self.__edit_telegraph()
+        if len(self.path) > 1:
+            telegraph.edit_telegraph(self.path, self.telegraph_content)
 
         msg = f"<b>Found {contents_count} result for <i>{fileName}</i></b>"
         buttons = ButtonMaker()
@@ -899,7 +879,7 @@ class GoogleDriveHelper:
                 break
 
     @retry(wait=wait_exponential(multiplier=2, min=3, max=6), stop=stop_after_attempt(3),
-           retry=retry_if_exception_type(HttpError), before=before_log(LOGGER, logging.DEBUG))
+           retry=(retry_if_exception_type(HttpError) | retry_if_exception_type(IOError)), before=before_log(LOGGER, logging.DEBUG))
     def __download_file(self, file_id, path, filename, mime_type):
         request = self.__service.files().get_media(fileId=file_id)
         filename = filename.replace('/', '')
@@ -929,8 +909,7 @@ class GoogleDriveHelper:
                             LOGGER.info(f"Got: {reason}, Trying Again...")
                             return self.__download_file(file_id, path, filename, mime_type)
                     else:
-                        self.is_cancelled = True
-                        LOGGER.info(f"Got: {reason}")
+                        LOGGER.error(f"Got: {reason}")
                         raise err
         self._file_downloaded_bytes = 0
 
